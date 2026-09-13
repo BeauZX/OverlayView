@@ -379,8 +379,57 @@ def find_phone_camera_index(names: Optional[list[str]] = None) -> Optional[int]:
     return None
 
 
-def open_camera(preferred_index: Optional[int] = None) -> Optional[cv2.VideoCapture]:
-    """依序嘗試開啟相機：指定索引 → 手機相機 → 其餘可用相機。"""
+class PiCamera:
+    """用 picamera2 讀取 Raspberry Pi CSI 相機，介面模仿 cv2.VideoCapture。
+
+    Pi 5 上 CSI 相機的 /dev/video0 只吐 raw Bayer，cv2.VideoCapture 拿不到可用畫面。
+    """
+    def __init__(self, width: int = 1280, height: int = 720):
+        from picamera2 import Picamera2  # type: ignore
+        self.cam = Picamera2()
+        config = self.cam.create_video_configuration(
+            main={"size": (width, height), "format": "RGB888"})
+        self.cam.configure(config)
+        self.cam.start()
+
+    def read(self) -> tuple[bool, Optional[np.ndarray]]:
+        frame = self.cam.capture_array("main")
+        if frame is None:
+            return False, None
+        # picamera2 的 RGB888 實際記憶體排列與 OpenCV 的 BGR 相同，直接使用即可。
+        return True, frame
+
+    def set(self, *_args):
+        # 解析度已在建構時設定，忽略後續 cap.set() 呼叫。
+        pass
+
+    def release(self):
+        self.cam.stop()
+        self.cam.close()
+
+
+def open_pi_camera() -> Optional[PiCamera]:
+    """有 picamera2 且有 CSI 相機時回傳 PiCamera，否則回傳 None。"""
+    try:
+        from picamera2 import Picamera2  # type: ignore
+    except ImportError:
+        return None
+    try:
+        if not Picamera2.global_camera_info():
+            return None
+        cam = PiCamera()
+        ok, _ = cam.read()
+        if ok:
+            print("[INFO] 使用 Raspberry Pi CSI 相機 (picamera2)")
+            return cam
+        cam.release()
+    except Exception as e:
+        print(f"[WARN] picamera2 開啟失敗：{e}")
+    return None
+
+
+def open_camera(preferred_index: Optional[int] = None):
+    """依序嘗試開啟相機：指定索引 → Pi CSI 相機 → 手機相機 → 其餘可用相機。"""
     backend = cv2.CAP_AVFOUNDATION if sys.platform == "darwin" else cv2.CAP_ANY
     names = list_macos_cameras()
 
@@ -388,6 +437,9 @@ def open_camera(preferred_index: Optional[int] = None) -> Optional[cv2.VideoCapt
     if preferred_index is not None:
         candidates.append(preferred_index)
     else:
+        pi_cam = open_pi_camera()
+        if pi_cam is not None:
+            return pi_cam
         phone_idx = find_phone_camera_index(names)
         if phone_idx is not None:
             candidates.append(phone_idx)
