@@ -1,0 +1,12 @@
+[project]
+name = "overlayview"
+version = "0.1.0"
+requires-python = "==3.13.*"
+dependencies = [
+    "numpy==2.2.4",
+    "opencv-python>=5.0.0.93",
+    "ultralytics>=8.4.123",
+]
+
+[tool.uv]
+python-preference = "only-system"   # 不要自動下載 uv 版 Python

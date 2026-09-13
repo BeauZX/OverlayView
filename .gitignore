@@ -1,0 +1,7 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# HailoRT 每次執行都會在工作目錄寫這個
+hailort.log
