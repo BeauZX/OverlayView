@@ -10,15 +10,14 @@ from dataclasses import dataclass, field
 from typing import Optional
 
 # ============================================================
-# 嘗試載入 YOLOv8（ultralytics），若失敗改用 OpenCV DNN
+# 偵測後端：.hef → Hailo NPU（HailoRT）、.pt → ultralytics（CPU/GPU）
+# 兩者都延遲載入，避免不需要時還得等 torch import。
 # ============================================================
 try:
-    from ultralytics import YOLO
-    USE_YOLO = True
-    print("[INFO] 使用 YOLOv8 模型")
+    import hailo_platform  # noqa: F401
+    HAS_HAILO = True
 except ImportError:
-    USE_YOLO = False
-    print("[WARN] ultralytics 未安裝，改用 OpenCV DNN (需自備 .onnx 模型)")
+    HAS_HAILO = False
 
 
 # ============================================================
@@ -253,42 +252,115 @@ class OverlayRenderer:
 # ============================================================
 # 5. 偵測器包裝（YOLOv8 或 OpenCV DNN）
 # ============================================================
-class Detector:
-    # COCO 類別：只保留人與道路車輛。
-    TARGET_CLASS_IDS = (0, 1, 2, 3, 5, 7)
+# COCO 類別：只保留人與道路車輛。
+TARGET_CLASS_IDS = (0, 1, 2, 3, 5, 7)
+COCO_NAMES = {0: "person", 1: "bicycle", 2: "car", 3: "motorcycle",
+              5: "bus", 7: "truck"}
 
-    def __init__(self, model_path: str = "yolov8n.pt", conf: float = 0.4):
-        if USE_YOLO:
-            self.model = YOLO(model_path)
-            self.conf = conf
-        else:
-            # 若要用 OpenCV DNN，請自備 yolov8n.onnx 並改這裡
-            raise RuntimeError("請安裝 ultralytics：pip install ultralytics")
+
+class YoloDetector:
+    """ultralytics YOLOv8（CPU / GPU）。"""
+
+    def __init__(self, model_path: str, conf: float):
+        from ultralytics import YOLO
+        self.model = YOLO(model_path)
+        self.conf = conf
 
     def detect(self, frame: np.ndarray) -> list[tuple]:
         """
         回傳 list of (cx, cy, label, score, x1, y1, x2, y2)
         """
         results = []
-        if USE_YOLO:
-            # 在模型推論階段就排除其他類別，避免它們進入後續移動追蹤。
-            res = self.model(
-                frame,
-                conf=self.conf,
-                classes=list(self.TARGET_CLASS_IDS),
-                verbose=False,
-            )[0]
-            for box in res.boxes:
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
+        # 在模型推論階段就排除其他類別，避免它們進入後續移動追蹤。
+        res = self.model(
+            frame,
+            conf=self.conf,
+            classes=list(TARGET_CLASS_IDS),
+            verbose=False,
+        )[0]
+        for box in res.boxes:
+            x1, y1, x2, y2 = map(int, box.xyxy[0])
+            cx = (x1 + x2) // 2
+            cy = (y1 + y2) // 2
+            class_id = int(box.cls)
+            if class_id not in TARGET_CLASS_IDS:
+                continue
+            label = self.model.names[class_id]
+            score = float(box.conf)
+            results.append((cx, cy, label, score, x1, y1, x2, y2))
+        return results
+
+    def close(self):
+        pass
+
+
+class HailoDetector:
+    """HailoRT 推論 .hef（NMS 已編進模型，輸出每類一個 (n, 5) 陣列）。
+
+    輸出列格式：[y_min, x_min, y_max, x_max, score]，座標為 0~1 正規化。
+    """
+
+    def __init__(self, model_path: str, conf: float):
+        from hailo_platform import (VDevice, HailoSchedulingAlgorithm,
+                                    FormatType)
+        params = VDevice.create_params()
+        params.scheduling_algorithm = HailoSchedulingAlgorithm.ROUND_ROBIN
+        self.vdevice = VDevice(params)
+        self.infer_model = self.vdevice.create_infer_model(model_path)
+        self.infer_model.output().set_format_type(FormatType.FLOAT32)
+        self.conf = conf
+
+        in_shape = self.infer_model.input().shape  # [H, W, C]
+        self.in_h, self.in_w = in_shape[0], in_shape[1]
+
+        self.configured = self.infer_model.configure()
+        self.bindings = self.configured.create_bindings()
+        self.out_buf = np.zeros(self.infer_model.output().shape, np.float32)
+        self.bindings.output().set_buffer(self.out_buf)
+
+    def detect(self, frame: np.ndarray) -> list[tuple]:
+        h, w = frame.shape[:2]
+        # 模型吃 RGB；picamera2 / OpenCV 給的是 BGR。
+        rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        inp = np.ascontiguousarray(cv2.resize(rgb, (self.in_w, self.in_h)))
+        self.bindings.input().set_buffer(inp)
+        self.configured.run([self.bindings], 1000)
+
+        results = []
+        for class_id, boxes in enumerate(self.bindings.output().get_buffer()):
+            if class_id not in TARGET_CLASS_IDS or len(boxes) == 0:
+                continue
+            label = COCO_NAMES[class_id]
+            for ymin, xmin, ymax, xmax, score in boxes:
+                if score < self.conf:
+                    continue
+                x1 = int(np.clip(xmin * w, 0, w - 1))
+                y1 = int(np.clip(ymin * h, 0, h - 1))
+                x2 = int(np.clip(xmax * w, 0, w - 1))
+                y2 = int(np.clip(ymax * h, 0, h - 1))
                 cx = (x1 + x2) // 2
                 cy = (y1 + y2) // 2
-                class_id = int(box.cls)
-                if class_id not in self.TARGET_CLASS_IDS:
-                    continue
-                label = self.model.names[class_id]
-                score = float(box.conf)
-                results.append((cx, cy, label, score, x1, y1, x2, y2))
+                results.append((cx, cy, label, float(score), x1, y1, x2, y2))
         return results
+
+    def close(self):
+        # HailoRT 物件若交給直譯器結束時的 GC 亂序銷毀會 segfault，
+        # 必須依 bindings → configured → infer_model → vdevice 順序明確釋放。
+        del self.bindings, self.out_buf
+        self.configured.shutdown()
+        del self.configured, self.infer_model
+        self.vdevice.release()
+
+
+def Detector(model_path: str, conf: float = 0.4):
+    """依副檔名選擇後端：.hef → Hailo，其餘交給 ultralytics。"""
+    if model_path.lower().endswith(".hef"):
+        if not HAS_HAILO:
+            raise RuntimeError("找不到 hailo_platform，請確認 venv 有開 --system-site-packages")
+        print(f"[INFO] 使用 Hailo NPU 推論：{model_path}")
+        return HailoDetector(model_path, conf)
+    print(f"[INFO] 使用 ultralytics 推論：{model_path}")
+    return YoloDetector(model_path, conf)
 
 
 # ============================================================
@@ -471,8 +543,14 @@ def open_camera(preferred_index: Optional[int] = None):
 def main():
     parser = argparse.ArgumentParser(description="物件偵測 + 追蹤 + 警報系統")
     parser.add_argument("--camera", type=int, default=None,
-                        help="指定相機索引；不指定時自動優先選 iPhone 接續互通相機")
+                        help="指定相機索引；不指定時自動優先選 Pi CSI 相機或 iPhone 接續互通相機")
+    parser.add_argument("--model", default=None,
+                        help="模型路徑（.hef 走 Hailo NPU、.pt 走 ultralytics）；"
+                             "預設有 Hailo 就用 yolov8n.hef，否則 yolov8n.pt")
+    parser.add_argument("--conf", type=float, default=0.4,
+                        help="偵測信心門檻（預設 0.4）")
     args = parser.parse_args()
+    model_path = args.model or ("yolov8n.hef" if HAS_HAILO else "yolov8n.pt")
 
     print("=" * 50)
     print("  物件偵測 + 追蹤 + 警報系統")
@@ -490,7 +568,7 @@ def main():
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
 
     try:
-        detector = Detector(model_path="yolov8n.pt", conf=0.4)
+        detector = Detector(model_path, conf=args.conf)
     except Exception as e:
         print(f"[ERROR] 模型載入失敗：{e}")
         cap.release()
@@ -562,6 +640,7 @@ def main():
             print("[INFO] 追蹤器已重設")
 
     cap.release()
+    detector.close()
     cv2.destroyAllWindows()
 
 
